@@ -154,9 +154,9 @@ curl -X POST http://localhost:8000/chat \
 
 | ID         | Nombre                 | Descripción              |
 | ---------- | ---------------------- | ------------------------ |
-| `cata`     | Asistente General FCPN | Consultas académicas     |
-| `fito`     | Trámites Académicos    | Procesos administrativos |
-| `guia_fie` | Soporte Técnico        | Ayuda técnica            |
+| `kardex`     | Asistente General FCPN | Consultas académicas     |
+| `info`     | Trámites Académicos    | Procesos administrativos |
+
 
 ---
 
