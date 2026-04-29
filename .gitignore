@@ -1,0 +1,63 @@
+# ======================
+# OS
+# ======================
+.DS_Store
+Thumbs.db
+
+# ======================
+# ENV / Secrets
+# ======================
+.env
+.env.*
+*.env
+
+# ======================
+# Python (Backend)
+# ======================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+
+# virtual environments
+venv/
+.venv/
+env/
+
+# ======================
+# Node (Frontend)
+# ======================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# build
+dist/
+build/
+.next/
+out/
+
+# ======================
+# Logs
+# ======================
+*.log
+
+# ======================
+# IDEs
+# ======================
+.vscode/
+.idea/
+
+# ======================
+# Coverage
+# ======================
+coverage/
+htmlcov/
+
+# ======================
+# Misc
+# ======================
+*.lock
