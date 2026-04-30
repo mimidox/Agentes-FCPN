@@ -359,48 +359,62 @@ def _parse_search_results(data: dict) -> list[SearchDocument]:
 
 async def search_documents(query: str, top: int = 5) -> list[SearchDocument]:
     """
-    Busca en Azure AI Search con fallback automático:
-      1. Intenta búsqueda SEMÁNTICA (mejor calidad, requiere configuración semántica).
-      2. Si falla (400/error de config), cae a búsqueda SIMPLE.
+    Busca en Azure AI Search.
+    - Salta directamente a búsqueda simple (la semántica no está configurada).
+    - Usa searchMode "any" para que baste con que aparezca al menos una palabra.
+    - Si la query tiene más de 4 palabras, también lanza una búsqueda exacta
+      con la frase completa y combina los resultados.
     """
     if not AZURE_SEARCH_ENDPOINT or not AZURE_SEARCH_QUERY_KEY or not AZURE_SEARCH_INDEX:
         print("⚠️  RAG desactivado: faltan variables AZURE_SEARCH_* en .env")
         return []
 
+    url     = f"{AZURE_SEARCH_ENDPOINT}/indexes/{AZURE_SEARCH_INDEX}/docs/search"
+    headers = {
+        "Content-Type": "application/json",
+        "api-key": AZURE_SEARCH_QUERY_KEY,
+    }
+
+    payload_any = {
+        "search":     query,
+        "top":        top,
+        "select":     _SEARCH_SELECT,
+        "queryType":  "simple",
+        "searchMode": "any",
+    }
+
+    results: list[SearchDocument] = []
+
     async with httpx.AsyncClient(timeout=15.0) as client:
+        data = await _call_search(client, payload_any)
 
-        # --- Intento 1: búsqueda semántica ---
-        payload_semantic = {
-            "search": query,
-            "top": top,
-            "select": _SEARCH_SELECT,
-            "queryType": "semantic",
-            "semanticConfiguration": "default",
-            "captions": "extractive",
-            "answers": "extractive|count-3",
-            "searchMode": "all",
-        }
-        data = await _call_search(client, payload_semantic)
+        if data:
+            results = _parse_search_results(data)
 
-        # --- Fallback: búsqueda simple si la semántica falla ---
-        if data is None:
-            print("⚠️  Búsqueda semántica falló → usando búsqueda simple")
-            payload_simple = {
-                "search": query,
-                "top": top,
-                "select": _SEARCH_SELECT,
-                "queryType": "simple",
-                "searchMode": "all",
-            }
-            data = await _call_search(client, payload_simple)
+        if len(results) < 2:
+            keywords = " ".join(
+                w for w in query.split()
+                if len(w) > 3
+            )
+            if keywords and keywords != query:
+                payload_kw = {
+                    "search":     keywords,
+                    "top":        top,
+                    "select":     _SEARCH_SELECT,
+                    "queryType":  "simple",
+                    "searchMode": "any",
+                }
+                data_kw = await _call_search(client, payload_kw)
+                if data_kw:
+                    extra = _parse_search_results(data_kw)
+                    existing = {r.source for r in results}
+                    for doc in extra:
+                        if doc.source not in existing:
+                            results.append(doc)
+                            existing.add(doc.source)
 
-        if data is None:
-            print("❌ Azure Search no respondió en ninguno de los dos modos")
-            return []
-
-    results = _parse_search_results(data)
     print(f"🔍 RAG '{query[:60]}' → {len(results)} fragmentos recuperados")
-    return results
+    return results[:top]
 
 
 def build_rag_context(docs: list[SearchDocument]) -> str:
