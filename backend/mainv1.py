@@ -2,7 +2,7 @@
 FCPN Multi-Agent Chat API v3
 ============================
 Motor : GPT-4o mini · Azure AI Foundry
-RAG   : Azure AI Search (índice idx-rag)
+RAG   : Azure AI Search (índice rag-1777354953412)
 Auth  : API Key
 
 Ejecutar:
@@ -40,7 +40,7 @@ AZURE_OPENAI_API_VERSION: str = os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-0
 
 AZURE_SEARCH_ENDPOINT:    str = os.getenv("AZURE_SEARCH_ENDPOINT", "").rstrip("/")
 AZURE_SEARCH_QUERY_KEY:   str = os.getenv("AZURE_SEARCH_QUERY_KEY", "")
-AZURE_SEARCH_INDEX:       str = os.getenv("AZURE_SEARCH_INDEX", "idx-rag")  # ← nuevo índice
+AZURE_SEARCH_INDEX:       str = os.getenv("AZURE_SEARCH_INDEX", "")
 
 PORT:         int       = int(os.getenv("PORT", 8000))
 CORS_ORIGINS: list[str] = os.getenv(
@@ -68,7 +68,7 @@ app = FastAPI(
 ## Sistema de Chat Multi-Agente – FCPN/UMSA
 
 **Motor:** GPT-4o mini · Azure AI Foundry  
-**RAG:** Azure AI Search → índice `idx-rag`
+**RAG:** Azure AI Search → índice `rag-1777354953412`
 
 ### Agentes
 | ID | Nombre | Especialidad |
@@ -130,11 +130,6 @@ class ChatRequest(BaseModel):
     messages:   list[ChatMessage] = Field(..., min_length=1)
     session_id: Optional[str]     = None
     use_rag:    bool               = Field(True, description="Activar búsqueda en Azure AI Search")
-    # ── NUEVO: filtrar por categoría del índice (campo "category") ──────────
-    category_filter: Optional[str] = Field(
-        None,
-        description="Filtra los chunks por campo 'category' del índice (ej: 'Inscripciones')."
-    )
 
     model_config = {
         "json_schema_extra": {
@@ -143,18 +138,16 @@ class ChatRequest(BaseModel):
                 "messages": [{"role": "user", "content": "¿Cuántas materias aprobé?"}],
                 "session_id": "sess_abc123",
                 "use_rag": True,
-                "category_filter": None,
             }]
         }
     }
 
 class SearchDocument(BaseModel):
     """Fragmento de documento recuperado por Azure AI Search."""
-    title:    str
-    content:  str
-    category: Optional[str]  = None   # ← campo nuevo en el índice
-    source:   Optional[str]  = None
-    score:    Optional[float] = None
+    title:   str
+    content: str
+    source:  Optional[str]  = None
+    score:   Optional[float] = None
 
 class CitedDocument(BaseModel):
     filename:         str
@@ -303,12 +296,9 @@ AGENT_INDEX:    dict[AgentID, Agent] = {a.id: a for a in AGENTS}
 # Azure AI Search — RAG
 # ---------------------------------------------------------------------------
 
-# ── CAMBIO 1: SELECT actualizado con el campo "category" del nuevo índice ──
-_SEARCH_SELECT      = "id,chunk_id,parent_id,chunk,title,category"
-_SEARCH_API_VERSION = "2024-07-01"
-
-# ── CAMBIO 2: nombre exacto de la configuración semántica del nuevo índice ──
-_SEMANTIC_CONFIG = "config-semantica-rag"
+# Campos reales confirmados del índice: chunk_id, parent_id, chunk, title, text_vector
+_SEARCH_SELECT = "chunk_id,parent_id,chunk,title"
+_SEARCH_API_VERSION = "2023-11-01"
 
 
 async def _call_search(client: httpx.AsyncClient, payload: dict) -> dict | None:
@@ -342,11 +332,9 @@ def _parse_search_results(data: dict) -> list[SearchDocument]:
     """Convierte el JSON de Azure Search en lista de SearchDocument."""
     results: list[SearchDocument] = []
     for item in data.get("value", []):
-        title_val    = item.get("title") or "Documento"
-        source_val   = item.get("parent_id") or item.get("chunk_id") or ""
-        content_val  = (item.get("chunk") or "").strip()
-        # ── CAMBIO 3: extraer el campo "category" del nuevo índice ──────────
-        category_val = item.get("category") or None
+        title_val   = item.get("title") or "Documento"
+        source_val  = item.get("parent_id") or item.get("chunk_id") or ""
+        content_val = (item.get("chunk") or "").strip()
 
         # Fallback a captions si el chunk vino vacío
         if not content_val:
@@ -363,63 +351,47 @@ def _parse_search_results(data: dict) -> list[SearchDocument]:
         results.append(SearchDocument(
             title=title_val,
             content=content_val[:1200],
-            category=category_val,
             source=source_val,
             score=round(float(score), 4) if score else None,
         ))
     return results
 
 
-async def search_documents(
-    query: str,
-    top: int = 5,
-    category_filter: Optional[str] = None,
-) -> list[SearchDocument]:
+async def search_documents(query: str, top: int = 5) -> list[SearchDocument]:
     """
     Busca en Azure AI Search con fallback automático:
-      1. Intenta búsqueda SEMÁNTICA (mejor calidad).
-      2. Si falla, cae a búsqueda SIMPLE.
-
-    Acepta category_filter para restringir por el campo "category" del índice.
+      1. Intenta búsqueda SEMÁNTICA (mejor calidad, requiere configuración semántica).
+      2. Si falla (400/error de config), cae a búsqueda SIMPLE.
     """
     if not AZURE_SEARCH_ENDPOINT or not AZURE_SEARCH_QUERY_KEY or not AZURE_SEARCH_INDEX:
         print("⚠️  RAG desactivado: faltan variables AZURE_SEARCH_* en .env")
         return []
 
-    # ── CAMBIO 4: filtro OData por "category" si se recibe ──────────────────
-    odata_filter = f"category eq '{category_filter}'" if category_filter else None
-
     async with httpx.AsyncClient(timeout=15.0) as client:
 
         # --- Intento 1: búsqueda semántica ---
-        payload_semantic: dict = {
+        payload_semantic = {
             "search": query,
             "top": top,
             "select": _SEARCH_SELECT,
             "queryType": "semantic",
-            "semanticConfiguration": _SEMANTIC_CONFIG,   # ← nombre correcto
+            "semanticConfiguration": "default",
             "captions": "extractive",
             "answers": "extractive|count-3",
             "searchMode": "all",
         }
-        if odata_filter:
-            payload_semantic["filter"] = odata_filter
-
         data = await _call_search(client, payload_semantic)
 
         # --- Fallback: búsqueda simple si la semántica falla ---
         if data is None:
             print("⚠️  Búsqueda semántica falló → usando búsqueda simple")
-            payload_simple: dict = {
+            payload_simple = {
                 "search": query,
                 "top": top,
                 "select": _SEARCH_SELECT,
                 "queryType": "simple",
                 "searchMode": "all",
             }
-            if odata_filter:
-                payload_simple["filter"] = odata_filter
-
             data = await _call_search(client, payload_simple)
 
         if data is None:
@@ -437,12 +409,10 @@ def build_rag_context(docs: list[SearchDocument]) -> str:
         return ""
     parts = ["=== DOCUMENTOS INSTITUCIONALES (usa SOLO esta información) ===\n"]
     for i, doc in enumerate(docs, 1):
-        score_str    = f" | relevancia: {doc.score}" if doc.score else ""
-        source_str   = f"\n   Fuente: {doc.source}" if doc.source else ""
-        # ── CAMBIO 5: mostrar categoría en el contexto si existe ────────────
-        category_str = f"\n   Categoría: {doc.category}" if doc.category else ""
+        score_str  = f" | relevancia: {doc.score}" if doc.score else ""
+        source_str = f"\n   Fuente: {doc.source}" if doc.source else ""
         parts.append(
-            f"[Doc {i}] {doc.title}{score_str}{source_str}{category_str}\n"
+            f"[Doc {i}] {doc.title}{score_str}{source_str}\n"
             f"{doc.content}\n"
             f"{'─' * 50}"
         )
@@ -462,12 +432,10 @@ def detect_cited_doc(
     if search_results:
         top_doc   = search_results[0]
         score_str = f" (score: {top_doc.score})" if top_doc.score else ""
-        # ── CAMBIO 6: incluir categoría en el motivo de relevancia ──────────
-        category_note = f" · categoría: {top_doc.category}" if top_doc.category else ""
         return CitedDocument(
             filename=top_doc.title or "Documento institucional",
             document_type=ResourceType.DOCX,
-            relevance_reason=f"Recuperado del índice RAG{score_str}{category_note}",
+            relevance_reason=f"Recuperado del índice RAG{score_str}",
             preview_url=None,
         )
 
@@ -523,7 +491,6 @@ async def root():
         "provider": "Azure AI Foundry",
         "deployment": AZURE_OPENAI_DEPLOYMENT,
         "search_index": AZURE_SEARCH_INDEX or "no configurado",
-        "semantic_config": _SEMANTIC_CONFIG,
         "rag_enabled": bool(AZURE_SEARCH_ENDPOINT and AZURE_SEARCH_QUERY_KEY and AZURE_SEARCH_INDEX),
     }
 
@@ -561,11 +528,10 @@ async def get_agent(agent_id: AgentID) -> Agent:
         "Envía un mensaje a un agente. Si `use_rag=true` (por defecto), primero busca "
         "en Azure AI Search para enriquecer la respuesta con documentos institucionales.\n\n"
         "**Flujo:**\n"
-        "1. Búsqueda semántica en índice `idx-rag` con config `config-semantica-rag` (con fallback simple)\n"
+        "1. Búsqueda semántica en índice `rag-1777354953412` (con fallback simple)\n"
         "2. Fragmentos relevantes → contexto del system prompt\n"
         "3. GPT-4o mini genera la respuesta fundamentada\n"
-        "4. Se detecta y adjunta el documento citado\n\n"
-        "Puedes pasar `category_filter` para restringir la búsqueda a una categoría del índice."
+        "4. Se detecta y adjunta el documento citado"
     ),
     tags=["Chat"],
     responses={
@@ -580,21 +546,18 @@ async def post_chat(body: ChatRequest) -> ChatResponse:
 
     session_id = body.session_id or f"sess_{uuid.uuid4().hex[:10]}"
 
-    # 1. RAG
+    # 1. RAG — busca SIEMPRE si use_rag=True
     search_results: list[SearchDocument] = []
     rag_used = False
 
     if body.use_rag:
+        # Combina los últimos 2 mensajes del usuario para mejor contexto de búsqueda
         user_msgs    = [m.content for m in body.messages if m.role == "user"]
         search_query = " ".join(user_msgs[-2:])
 
         print(f"🔎 Buscando en RAG: '{search_query[:80]}'")
-        search_results = await search_documents(
-            search_query,
-            top=5,
-            category_filter=body.category_filter,   # ← CAMBIO 7: pasar filtro
-        )
-        rag_used = len(search_results) > 0
+        search_results = await search_documents(search_query, top=5)
+        rag_used       = len(search_results) > 0
 
         if not rag_used:
             print("⚠️  RAG no devolvió resultados — el modelo responderá sin contexto documental")
@@ -679,22 +642,17 @@ async def get_resource(resource_id: str) -> Resource:
     description="Consulta directa al índice de Azure AI Search. Útil para debug.",
     tags=["Búsqueda"],
 )
-async def search(
-    q: str,
-    top: int = 5,
-    category: Optional[str] = None,
-) -> dict[str, Any]:
-    results = await search_documents(q, top=top, category_filter=category)
+async def search(q: str, top: int = 5) -> dict[str, Any]:
+    results = await search_documents(q, top=top)
     return {
         "query": q,
-        "category_filter": category,
         "results": [r.model_dump() for r in results],
         "total": len(results),
     }
 
 
 # ---------------------------------------------------------------------------
-# Debug endpoints
+# Debug endpoints — úsalos para diagnosticar el RAG
 # ---------------------------------------------------------------------------
 
 @app.get("/debug/config", tags=["Debug"])
@@ -707,7 +665,6 @@ async def debug_config():
         "AZURE_SEARCH_ENDPOINT":    AZURE_SEARCH_ENDPOINT or "❌ VACÍO",
         "AZURE_SEARCH_INDEX":       AZURE_SEARCH_INDEX or "❌ VACÍO",
         "AZURE_SEARCH_KEY_set":     bool(AZURE_SEARCH_QUERY_KEY),
-        "semantic_config":          _SEMANTIC_CONFIG,
         "rag_ready": bool(AZURE_SEARCH_ENDPOINT and AZURE_SEARCH_QUERY_KEY and AZURE_SEARCH_INDEX),
     }
 
@@ -716,6 +673,7 @@ async def debug_config():
 async def debug_fields():
     """
     Inspecciona los campos reales del índice y trae un documento de muestra.
+    Llama esto primero para confirmar qué campos existen.
     """
     if not AZURE_SEARCH_ENDPOINT or not AZURE_SEARCH_QUERY_KEY or not AZURE_SEARCH_INDEX:
         return {"error": "Variables AZURE_SEARCH_* no configuradas — revisa /debug/config"}
@@ -726,6 +684,7 @@ async def debug_fields():
     }
 
     async with httpx.AsyncClient(timeout=15) as client:
+        # Definición del índice (nombres de campos)
         idx_url  = f"{AZURE_SEARCH_ENDPOINT}/indexes/{AZURE_SEARCH_INDEX}"
         idx_resp = await client.get(
             idx_url,
@@ -739,6 +698,7 @@ async def debug_fields():
                 for f in idx_resp.json().get("fields", [])
             ]
 
+        # Un documento de muestra sin filtro de select (trae todo)
         sample_url  = f"{AZURE_SEARCH_ENDPOINT}/indexes/{AZURE_SEARCH_INDEX}/docs/search"
         sample_resp = await client.post(
             sample_url,
@@ -746,12 +706,13 @@ async def debug_fields():
             headers=headers,
             json={"search": "*", "top": 1},
         )
-        sample_keys    = []
+        sample_keys = []
         sample_preview = {}
         if sample_resp.status_code == 200:
             docs = sample_resp.json().get("value", [])
             if docs:
                 sample_keys    = list(docs[0].keys())
+                # Muestra los primeros 300 chars de cada campo de texto
                 sample_preview = {
                     k: str(v)[:300] if isinstance(v, str) else type(v).__name__
                     for k, v in docs[0].items()
@@ -759,8 +720,6 @@ async def debug_fields():
                 }
 
     return {
-        "index_name":     AZURE_SEARCH_INDEX,
-        "semantic_config": _SEMANTIC_CONFIG,
         "index_fields":   index_fields,
         "sample_keys":    sample_keys,
         "sample_preview": sample_preview,
@@ -772,6 +731,7 @@ async def debug_raw_search(q: str = "horarios"):
     """
     Llama directamente a Azure Search con la query dada y devuelve
     la respuesta cruda. Prueba ambos modos: semántico y simple.
+    Úsalo para diagnosticar por qué /search retorna vacío.
     """
     if not AZURE_SEARCH_ENDPOINT or not AZURE_SEARCH_QUERY_KEY or not AZURE_SEARCH_INDEX:
         return {"error": "Variables AZURE_SEARCH_* no configuradas — revisa /debug/config"}
@@ -787,7 +747,7 @@ async def debug_raw_search(q: str = "horarios"):
         "top": 3,
         "select": _SEARCH_SELECT,
         "queryType": "semantic",
-        "semanticConfiguration": _SEMANTIC_CONFIG,   # ← nombre correcto
+        "semanticConfiguration": "default",
         "captions": "extractive",
         "searchMode": "all",
     }
@@ -800,15 +760,16 @@ async def debug_raw_search(q: str = "horarios"):
         "searchMode": "all",
     }
 
+    # Sin select — para ver TODOS los campos crudos
     payload_no_select = {
         "search": q,
         "top": 1,
     }
 
     async with httpx.AsyncClient(timeout=15) as client:
-        r_semantic  = await client.post(url, params={"api-version": _SEARCH_API_VERSION}, headers=headers, json=payload_semantic)
-        r_simple    = await client.post(url, params={"api-version": _SEARCH_API_VERSION}, headers=headers, json=payload_simple)
-        r_no_select = await client.post(url, params={"api-version": _SEARCH_API_VERSION}, headers=headers, json=payload_no_select)
+        r_semantic   = await client.post(url, params={"api-version": _SEARCH_API_VERSION}, headers=headers, json=payload_semantic)
+        r_simple     = await client.post(url, params={"api-version": _SEARCH_API_VERSION}, headers=headers, json=payload_simple)
+        r_no_select  = await client.post(url, params={"api-version": _SEARCH_API_VERSION}, headers=headers, json=payload_no_select)
 
     def safe_json(r: httpx.Response) -> dict:
         try:
@@ -818,21 +779,19 @@ async def debug_raw_search(q: str = "horarios"):
 
     return {
         "query": q,
-        "index": AZURE_SEARCH_INDEX,
-        "semantic_config": _SEMANTIC_CONFIG,
         "semantic": {
-            "status":   r_semantic.status_code,
-            "count":    len(safe_json(r_semantic).get("value", [])),
-            "response": safe_json(r_semantic),
+            "status":       r_semantic.status_code,
+            "count":        len(safe_json(r_semantic).get("value", [])),
+            "response":     safe_json(r_semantic),
         },
         "simple": {
-            "status":   r_simple.status_code,
-            "count":    len(safe_json(r_simple).get("value", [])),
-            "response": safe_json(r_simple),
+            "status":       r_simple.status_code,
+            "count":        len(safe_json(r_simple).get("value", [])),
+            "response":     safe_json(r_simple),
         },
         "no_select_raw": {
-            "status":         r_no_select.status_code,
+            "status":       r_no_select.status_code,
             "first_doc_keys": list(safe_json(r_no_select).get("value", [{}])[0].keys()) if safe_json(r_no_select).get("value") else [],
-            "response":       safe_json(r_no_select),
+            "response":     safe_json(r_no_select),
         },
     }
